@@ -1,0 +1,20 @@
+mail:
+  from:
+  smtp:
+    server: smtp.gmail.com
+    port: 587
+    user:
+    pass:
+confirm_link: https://localhost:9000/confirmMail/
+redis:
+  addr: blockbook-dev.corp:6379
+  pass: ""
+  db: 0
+hydra:
+  login_url: http://blockbook-dev.corp:4445/oauth2/auth/requests/login/
+  consent_url: http://blockbook-dev.corp:4445/oauth2/auth/requests/consent/
+default_scope:
+  # - openid
+  - offline
+  # - id_token
+listen_addr: :9000

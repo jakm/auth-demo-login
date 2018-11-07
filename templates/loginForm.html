@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+  <head>
+  <title>Login with e-mail</title>
+  <meta charset="UTF-8">
+  </head>
+  <body>
+    <h1>Login with e-mail</h1>
+	<form action="/login" method="post">
+      E-mail:<input type="text" name="email">
+      <input type="hidden" name="challenge" value="{{ .challenge }}">
+      <input type="submit" value="Login">
+    </form>
+  </body>
+</html>

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+  <head>
+  <title>An application requests access to your data!</title>
+  <meta charset="UTF-8">
+  </head>
+  <body>
+    <h1>An application requests access to your data!</h1>
+	<form action="/consent" method="post">
+	  <p>
+        Hi <b>{{ .subject }}</b>, application <b>{{ .clientName }}</b> wants access resources on your behalf and to:
+      </p>
+      <fieldset>
+        <legent>Permissions</legend>
+        <p style="padding: 0 0 0 20px">
+        {{- range $scope := .requestedScope }}
+          <input type="checkbox" name="grant_scope" id="{{ $scope }}" value="{{ $scope }}">
+          <label for="{{ $scope }}">{{ $scope }}</label><br/>
+        {{end -}}
+        </p>
+      </fieldset>
+      <p>
+        <input type="submit" name="submit" value="Allow access">
+        <input type="submit" name="submit" value="Deny access">
+      </p>
+      <input type="hidden" name="challenge" value="{{ .challenge }}">
+      <input type="hidden" name="subject" value="{{ .subject }}">
+    </form>
+  </body>
+</html>
