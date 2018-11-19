@@ -66,6 +66,7 @@ type ConsentAcceptReq struct {
 type LoginContext struct {
 	Challenge string `json:"challenge"`
 	Email     string `json:"email"`
+	Subject   string `json:"subject"`
 }
 
 func init() {
@@ -115,7 +116,13 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		sendConfirmEmail(w, r, email, challenge)
+		subject, err := makeSubject(email)
+		if err != nil {
+			internalError(w, fmt.Errorf("Error getting subject for email %s: %s", email, err))
+			return
+		}
+
+		sendConfirmEmail(w, r, email, challenge, subject)
 		return
 	}
 
@@ -149,8 +156,9 @@ func consentHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		challenge := r.Form.Get("challenge")
 		subject := r.Form.Get("subject")
-		if challenge == "" || subject == "" {
-			badRequestError(w, fmt.Errorf("Missing challenge or subject in form data"))
+		email := r.Form.Get("email")
+		if challenge == "" || subject == "" || email == "" {
+			badRequestError(w, fmt.Errorf("Missing field in form data"))
 			return
 		}
 		grantScope := r.Form["grant_scope"]
@@ -162,7 +170,7 @@ func consentHandler(w http.ResponseWriter, r *http.Request) {
 		if !accessGranted {
 			rejectConsent(w, r, challenge, subject)
 		} else {
-			acceptConsent(w, r, challenge, subject, false, grantScope)
+			acceptConsent(w, r, challenge, subject, email, false, grantScope)
 		}
 
 		return
@@ -180,11 +188,17 @@ func consentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if v.Skip {
-		acceptConsent(w, r, challenge, v.Subject, v.Skip, v.RequestedScope)
+	email, err := getEmailFromSubject(v.Subject)
+	if err != nil {
+		internalError(w, err)
+		return
 	}
 
-	showConsentForm(w, r, challenge, v)
+	if v.Skip {
+		acceptConsent(w, r, challenge, v.Subject, email, v.Skip, v.RequestedScope)
+	}
+
+	showConsentForm(w, r, challenge, email, v)
 }
 
 func callbackHandler(w http.ResponseWriter, r *http.Request) {
@@ -284,7 +298,7 @@ func showLoginForm(w http.ResponseWriter, r *http.Request, challenge string) {
 	executeTemplate(w, "templates/loginForm.html", map[string]interface{}{"challenge": challenge})
 }
 
-func showConsentForm(w http.ResponseWriter, r *http.Request, challenge string, consent ConsentStatusRes) {
+func showConsentForm(w http.ResponseWriter, r *http.Request, challenge, email string, consent ConsentStatusRes) {
 	scope := []string{}
 LOOP:
 	for _, s := range consent.RequestedScope {
@@ -299,13 +313,14 @@ LOOP:
 	executeTemplate(w, "templates/consentForm.html", map[string]interface{}{
 		"challenge":      challenge,
 		"subject":        consent.Subject,
+		"email":          email,
 		"clientName":     consent.Client.Name,
 		"requestedScope": scope,
 	})
 }
 
-func sendConfirmEmail(w http.ResponseWriter, r *http.Request, email, challenge string) {
-	id, err := storeLoginStatus(challenge, email)
+func sendConfirmEmail(w http.ResponseWriter, r *http.Request, email, challenge, subject string) {
+	id, err := storeLoginStatus(challenge, email, subject)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -324,7 +339,7 @@ func sendConfirmEmail(w http.ResponseWriter, r *http.Request, email, challenge s
 </html>`, config.ConfirmLink+id)
 }
 
-func storeLoginStatus(challenge, email string) (string, error) {
+func storeLoginStatus(challenge, email, subject string) (string, error) {
 	var id, key string
 	for {
 		id = ksuid.New().String()
@@ -332,6 +347,7 @@ func storeLoginStatus(challenge, email string) (string, error) {
 		b, err := json.Marshal(LoginContext{
 			Challenge: challenge,
 			Email:     email,
+			Subject:   subject,
 		})
 		if err != nil {
 			return "", err
@@ -365,6 +381,15 @@ func confirmMailHandler(w http.ResponseWriter, r *http.Request) {
 	err = json.Unmarshal([]byte(s), &ctx)
 	if err != nil {
 		internalError(w, err)
+		return
+	}
+
+	if ctx.Subject == "" {
+		ctx.Subject, err = makeSubject(ctx.Email)
+		if err != nil {
+			internalError(w, fmt.Errorf("Error getting subject for email %s: %s", ctx.Email, err))
+			return
+		}
 	}
 
 	v, err := getLoginStatus(ctx.Challenge)
@@ -376,7 +401,7 @@ func confirmMailHandler(w http.ResponseWriter, r *http.Request) {
 	if v.Skip {
 		subject = v.Subject
 	} else {
-		subject = ctx.Email
+		subject = ctx.Subject
 	}
 
 	acceptLogin(w, r, ctx.Challenge, subject, v.Skip)
@@ -423,7 +448,7 @@ func getConsentStatus(challenge string) (v ConsentStatusRes, err error) {
 	return
 }
 
-func acceptConsent(w http.ResponseWriter, r *http.Request, challenge, subject string, skip bool, grantScope []string) {
+func acceptConsent(w http.ResponseWriter, r *http.Request, challenge, subject, email string, skip bool, grantScope []string) {
 LOOP:
 	for _, s := range config.DefaultScope {
 		for _, s2 := range grantScope {
@@ -439,9 +464,8 @@ LOOP:
 	req := ConsentAcceptReq{
 		GrantScope: grantScope,
 	}
-	req.Session.IDToken = map[string]interface{}{
-		"email":          subject,
-		"email_verified": true,
+	req.Session.AccessToken = map[string]interface{}{
+		"email": email,
 	}
 	if !skip {
 		req.Remember = true
@@ -511,4 +535,32 @@ func rejectConsent(w http.ResponseWriter, r *http.Request, challenge, subject st
 	}
 
 	http.Redirect(w, r, v.RedirectTo, http.StatusFound)
+}
+
+func getSubjectFromEmail(email string) (subject string, err error) {
+	subject, err = redisClient.Get("email2subject:" + email).Result()
+	return
+}
+
+func getEmailFromSubject(subject string) (email string, err error) {
+	email, err = redisClient.Get("subject2email:" + subject).Result()
+	return
+}
+
+func makeSubject(email string) (subject string, err error) {
+	id := ksuid.New().String()
+	var ok bool
+	ok, err = redisClient.SetNX("email2subject:"+email, id, 0).Result()
+	if err != nil {
+		return
+	}
+	if ok {
+		subject = id
+		_, err = redisClient.Set("subject2email:"+subject, email, 0).Result()
+		// TODO remove email2subject
+	} else {
+		subject, err = getSubjectFromEmail(email)
+	}
+
+	return
 }

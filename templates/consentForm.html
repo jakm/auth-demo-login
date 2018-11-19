@@ -8,7 +8,7 @@
     <h1>An application requests access to your data!</h1>
 	<form action="/consent" method="post">
 	  <p>
-        Hi <b>{{ .subject }}</b>, application <b>{{ .clientName }}</b> wants access resources on your behalf and to:
+        Hi <b>{{ .email }}</b>, application <b>{{ .clientName }}</b> wants access resources on your behalf and to:
       </p>
       <fieldset>
         <legent>Permissions</legend>
@@ -25,6 +25,7 @@
       </p>
       <input type="hidden" name="challenge" value="{{ .challenge }}">
       <input type="hidden" name="subject" value="{{ .subject }}">
+      <input type="hidden" name="email" value="{{ .email }}">
     </form>
   </body>
 </html>
