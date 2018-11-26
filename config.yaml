@@ -5,7 +5,7 @@ mail:
     port: 587
     user:
     pass:
-confirm_link: https://localhost:9000/confirmMail/
+confirm_link: https://localhost:9000/register/confirm/
 redis:
   addr: blockbook-dev.corp:6379
   pass: ""

@@ -63,10 +63,8 @@ type ConsentAcceptReq struct {
 	} `json:"session"`
 }
 
-type LoginContext struct {
-	Challenge string `json:"challenge"`
-	Email     string `json:"email"`
-	Subject   string `json:"subject"`
+type RegistrationContext struct {
+	Email string `json:"email"`
 }
 
 func init() {
@@ -96,13 +94,16 @@ func main() {
 
 	router.HandleFunc("/login", loginHandler)
 	router.HandleFunc("/consent", consentHandler)
-	router.HandleFunc("/confirmMail/{id}", confirmMailHandler)
 	router.HandleFunc("/callback", callbackHandler)
+	router.HandleFunc("/register", registerHandler)
+	router.HandleFunc("/register/confirm/{id}", confirmRegistrationHandler)
+	// router.HandleFunc("/reset", resetHandler)
+	// router.HandleFunc("/reset/confirm", confirmResetHandler)
 
 	http.ListenAndServeTLS(config.ListenAddr, "cert/server.crt", "cert/server.key", router)
 }
 
-func loginHandler(w http.ResponseWriter, r *http.Request) {
+func registerHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		err := r.ParseForm()
 		if err != nil {
@@ -110,41 +111,61 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		email := r.Form.Get("email")
-		challenge := r.Form.Get("challenge")
-		if email == "" || challenge == "" {
-			badRequestError(w, fmt.Errorf("Missing email or challenge in form data"))
+		if email == "" {
+			badRequestError(w, fmt.Errorf("Missing email in form data"))
 			return
 		}
 
-		subject, err := makeSubject(email)
-		if err != nil {
-			internalError(w, fmt.Errorf("Error getting subject for email %s: %s", email, err))
-			return
-		}
-
-		sendConfirmEmail(w, r, email, challenge, subject)
+		sendRegistrationEmail(w, r, email)
 		return
 	}
 
-	challenge := r.URL.Query().Get("login_challenge")
-	if challenge == "" {
-		badRequestError(w, fmt.Errorf("Missing challenge argument: %s", r.URL.String()))
-		return
-	}
+	showRegistrationForm(w, r)
+}
 
-	v, err := getLoginStatus(challenge)
-	if err != nil {
-		internalError(w, err)
-		return
-	}
-	if v.Skip {
-		// XXX: verify login status in db
-		acceptLogin(w, r, challenge, v.Subject, v.Skip)
-		// rejectLogin(w, r, challenge, v.Subject)
-		return
-	}
-
-	showLoginForm(w, r, challenge)
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	// if r.Method == http.MethodPost {
+	// 	err := r.ParseForm()
+	// 	if err != nil {
+	// 		badRequestError(w, fmt.Errorf("Form parsing failed: %s", err))
+	// 		return
+	// 	}
+	// 	email := r.Form.Get("email")
+	// 	challenge := r.Form.Get("challenge")
+	// 	if email == "" || challenge == "" {
+	// 		badRequestError(w, fmt.Errorf("Missing email or challenge in form data"))
+	// 		return
+	// 	}
+	//
+	// 	subject, err := makeSubject(email)
+	// 	if err != nil {
+	// 		internalError(w, fmt.Errorf("Error getting subject for email %s: %s", email, err))
+	// 		return
+	// 	}
+	//
+	// 	sendRegistrationConfirmEmail(w, r, email, challenge, subject)
+	// 	return
+	// }
+	//
+	// challenge := r.URL.Query().Get("login_challenge")
+	// if challenge == "" {
+	// 	badRequestError(w, fmt.Errorf("Missing challenge argument: %s", r.URL.String()))
+	// 	return
+	// }
+	//
+	// v, err := getLoginStatus(challenge)
+	// if err != nil {
+	// 	internalError(w, err)
+	// 	return
+	// }
+	// if v.Skip {
+	// 	// XXX: verify login status in db
+	// 	acceptLogin(w, r, challenge, v.Subject, v.Skip)
+	// 	// rejectLogin(w, r, challenge, v.Subject)
+	// 	return
+	// }
+	//
+	// showLoginForm(w, r, challenge)
 }
 
 func consentHandler(w http.ResponseWriter, r *http.Request) {
@@ -207,7 +228,7 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 
 func internalError(w http.ResponseWriter, err error) {
 	log.Print(err)
-	w.WriteHeader(http.StatusInternalServerError)
+	http.Error(w, "Internal server error", http.StatusInternalServerError)
 }
 
 func badRequestError(w http.ResponseWriter, err error) {
@@ -298,6 +319,10 @@ func showLoginForm(w http.ResponseWriter, r *http.Request, challenge string) {
 	executeTemplate(w, "templates/loginForm.html", map[string]interface{}{"challenge": challenge})
 }
 
+func showRegistrationForm(w http.ResponseWriter, r *http.Request) {
+	executeTemplate(w, "templates/registrationForm.html", nil)
+}
+
 func showConsentForm(w http.ResponseWriter, r *http.Request, challenge, email string, consent ConsentStatusRes) {
 	scope := []string{}
 LOOP:
@@ -319,40 +344,32 @@ LOOP:
 	})
 }
 
-func sendConfirmEmail(w http.ResponseWriter, r *http.Request, email, challenge, subject string) {
-	id, err := storeLoginStatus(challenge, email, subject)
+func sendRegistrationEmail(w http.ResponseWriter, r *http.Request, email string) {
+	id, err := storeRegistrationContext(email)
 	if err != nil {
 		internalError(w, err)
 		return
 	}
 
-	// subject := "Please Verify Your Email Address"
-	// req := NewRequest([]string{email}, subject)
-	// req.Send("templates/confirmMail.html", map[string]string{"confirmLink": config.ConfirmLink + id})
+	subject := "Please Verify Your Email Address"
+	req := NewRequest([]string{email}, subject)
+	req.Send("templates/registrationEmail.html", map[string]string{"confirmLink": config.ConfirmLink + id})
 
-	fmt.Fprintf(w, `
-<html>
-<body>
-<h1>Mail was sent</h1>
-<p>DEBUG: <a href="%s">Confirmation link</a></p>
-</body>
-</html>`, config.ConfirmLink+id)
+	executeTemplate(w, "templates/registrationEmailSent.html", nil)
 }
 
-func storeLoginStatus(challenge, email, subject string) (string, error) {
+func storeRegistrationContext(email string) (string, error) {
 	var id, key string
 	for {
 		id = ksuid.New().String()
-		key = "login-context:" + id
-		b, err := json.Marshal(LoginContext{
-			Challenge: challenge,
-			Email:     email,
-			Subject:   subject,
+		key = "registration-context:" + id
+		b, err := json.Marshal(RegistrationContext{
+			Email: email,
 		})
 		if err != nil {
 			return "", err
 		}
-		ok, err := redisClient.SetNX(key, string(b), 24*time.Hour).Result()
+		ok, err := redisClient.SetNX(key, string(b), time.Hour).Result()
 		if err != nil {
 			return "", fmt.Errorf("Error setting key %s: %s", key, err)
 		}
@@ -364,47 +381,48 @@ func storeLoginStatus(challenge, email, subject string) (string, error) {
 	return id, nil
 }
 
-func confirmMailHandler(w http.ResponseWriter, r *http.Request) {
+func confirmRegistrationHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
 
-	s, err := redisClient.Get("login-context:" + id).Result()
+	s, err := redisClient.Get("registration-context:" + id).Result()
 	if err != nil {
 		if err == redis.Nil {
-			// XXX 404 link timed out bo neco takoveho
-			panic("XXX")
+			executeTemplate(w, "templates/linkExpired.html", nil)
+			return
 		}
 		internalError(w, err)
 		return
 	}
-	var ctx LoginContext
+	var ctx RegistrationContext
 	err = json.Unmarshal([]byte(s), &ctx)
 	if err != nil {
 		internalError(w, err)
 		return
 	}
 
-	if ctx.Subject == "" {
-		ctx.Subject, err = makeSubject(ctx.Email)
-		if err != nil {
-			internalError(w, fmt.Errorf("Error getting subject for email %s: %s", ctx.Email, err))
-			return
-		}
-	}
-
-	v, err := getLoginStatus(ctx.Challenge)
+	subject, err := getSubjectFromEmail(ctx.Email)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, fmt.Errorf("Error getting subject for email %s: %s", ctx.Email, err))
 		return
 	}
-	var subject string
-	if v.Skip {
-		subject = v.Subject
-	} else {
-		subject = ctx.Subject
+	if subject != "" {
+		log.Printf("Subject already registered: email=%s, subject=%s", ctx.Email, subject)
+		executeTemplate(w, "templates/alreadyRegistered.html", nil)
+		return
 	}
 
-	acceptLogin(w, r, ctx.Challenge, subject, v.Skip)
+	subject, err = makeSubject(ctx.Email)
+	if err != nil {
+		internalError(w, fmt.Errorf("Error getting subject for email %s: %s", ctx.Email, err))
+		return
+	}
+
+	showDeviceRegistrationForm(w, r, ctx.Email, subject)
+}
+
+func showDeviceRegistrationForm(w http.ResponseWriter, r *http.Request, email, subject string) {
+	fmt.Fprintf(w, "Registration succeed\n\nEmail: %s\nSubject: %s", email, subject)
 }
 
 func putJSON(url string, body []byte) (*http.Response, error) {
@@ -564,3 +582,11 @@ func makeSubject(email string) (subject string, err error) {
 
 	return
 }
+
+// func resetHandler(w http.ResponseWriter, r *http.Request) {
+// }
+//
+// func confirmResetHandler(w http.ResponseWriter, r *http.Request) {
+// 	// TODO subjekty nemazat, pri resetu ulozit staus a k zarizenim pridat status o zruseni (mely by mit jedinecna id), dodelat reset handler
+// 	// pro reset pridat expiraci
+// }
