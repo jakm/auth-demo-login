@@ -8,5 +8,7 @@ COPY --from=build /go/bin/auth-demo-login /opt/auth-demo-login/auth-demo-login
 ADD config.yaml /opt/auth-demo-login/config.yaml
 ADD cert /opt/auth-demo-login/cert
 ADD templates /opt/auth-demo-login/templates
+ADD js /opt/auth-demo-login/js
+ADD css /opt/auth-demo-login/css
 WORKDIR /opt/auth-demo-login
 CMD /opt/auth-demo-login/auth-demo-login

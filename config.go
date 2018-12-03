@@ -27,6 +27,10 @@ type Config struct {
 		LoginURL   string `yaml:"login_url"   env:"HYDRA_LOGIN_URL"`
 		ConsentURL string `yaml:"consent_url" env:"HYDRA_CONSENT_URL"`
 	} `yaml:"hydra"`
+	LoginPage struct {
+		Title string `yaml:"title" env:"LOGIN_PAGE_TITLE"`
+		URL   string `yaml:"url"   env:"LOGIN_PAGE_URL"`
+	} `yaml:"login_page"`
 	ConfirmLink  string   `yaml:"confirm_link"  env:"CONFIRM_LINK"`
 	DefaultScope []string `yaml:"default_scope" env:"DEFAULT_SCOPE"`
 	ListenAddr   string   `yaml:"listen_addr"   env:"LISTEN_ADDR"`

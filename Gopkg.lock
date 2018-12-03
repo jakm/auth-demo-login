@@ -2,6 +2,12 @@
 
 
 [[projects]]
+  branch = "master"
+  name = "github.com/btcsuite/btcd"
+  packages = ["btcec","chaincfg/chainhash","wire"]
+  revision = "3dcf298fed2d5fd65918dc560b3942b2aa0629e8"
+
+[[projects]]
   name = "github.com/go-redis/redis"
   packages = [".","internal","internal/consistenthash","internal/hashtag","internal/pool","internal/proto","internal/singleflight","internal/util"]
   revision = "b3d9bf10f6666b2ee5100a6f3f84f4caf3b4e37d"
@@ -40,6 +46,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "70a7468f78e0e625827505697679ce81c42c368edb158b620902b844e6c687a3"
+  inputs-digest = "da8620c09c6c6bbb0f05df1d36cfa76235bb3dee2e7ccb1a5af4ceb485d2d91b"
   solver-name = "gps-cdcl"
   solver-version = 1

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="/css/msg-boxes.css">
+    <script src="/js/jquery-3.3.1.min.js"></script>
+    <script src="/js/registerDevice.js"></script>
+
+    <title>Register your Trezor</title>
+</head>
+<body>
+    <strong>Register your Trezor</strong>
+
+    <br/>
+    <br/>
+    <div id="registered-devices" hidden>
+        <p>
+            List of registered devices:
+            <ul id="device-list">
+            </ul>
+        </p>
+    </div>
+    <div id="form-messages"></div>
+    <div id="device-registration">
+        <p>
+            <form id="device-registration-form" method="post" action="/register/done">
+                Label: <input type="text" name="label" />
+                <input type="hidden" name="challenge" value="{{ .challenge }}" />
+                <button type="button" id="btn-add-device">Add device</button>
+
+                <br />
+                <br />
+                <button type="submit">Finish</button>
+            </form>
+        </p>
+    </div>
+</body>
+</html>
