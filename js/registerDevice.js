@@ -11,7 +11,7 @@ $(function() {
     $('#device-registration-form').submit(function(event) {
         if ($('#device-list > li').length == 0) {
             let formMessages = $('#form-messages');
-            $(formMessages).addClass('notify-error');
+            $(formMessages).attr('class', 'notify-error');
             $(formMessages).text('No device added')
             event.preventDefault();
         }
@@ -28,7 +28,7 @@ function addDevice() {
     let challenge = $("#device-registration-form :input[name='challenge']");
 
     if (isEmpty($(label).val())) {
-        $(formMessages).addClass('notify-error');
+        $(formMessages).attr('class', 'notify-error');
         $(formMessages).text('Please fill out device label');
         return;
     }
@@ -36,7 +36,7 @@ function addDevice() {
     function setErrorMessage(error) {
         console.log(error);
 
-        $(formMessages).addClass('notify-error');
+        $(formMessages).attr('class', 'notify-error');
         $(formMessages).text('Device registration failed');
     };
 
@@ -66,7 +66,7 @@ function addDevice() {
                         case 201:
                             $(registeredDevices).show();
                             $(deviceList).append('<li>' + data.deviceLabel + ': ' + data.deviceID + '</li>');
-                            $(formMessages).addClass('notify-success');
+                            $(formMessages).attr('class', 'notify-success');
                             $(formMessages).text('Device added');
                             break;
                         default:
