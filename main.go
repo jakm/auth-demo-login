@@ -78,7 +78,7 @@ type AccountRegistrationContext struct {
 }
 
 type DeviceRegistrationContext struct {
-	Subject   string `json:"subject"`
+	Account   string `json:"account"`
 	Challenge string `json:"challenge,omitempty"`
 }
 
@@ -240,7 +240,7 @@ func consentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	email, err := getEmailFromSubject(v.Subject)
+	email, err := getEmailFromAccount(v.Subject)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -432,29 +432,29 @@ func confirmRegistrationHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	subject, err := getSubjectFromEmail(ctx.Email)
+	account, err := getAccountFromEmail(ctx.Email)
 	if err != nil {
-		internalError(w, fmt.Errorf("Error getting subject for email %s: %s", ctx.Email, err))
+		internalError(w, fmt.Errorf("Error getting account for email %s: %s", ctx.Email, err))
 		return
 	}
-	if subject != "" {
-		log.Printf("Subject already registered: email=%s, subject=%s", ctx.Email, subject)
+	if account != "" {
+		log.Printf("Account already registered: email=%s, id=%s", ctx.Email, account)
 		executeTemplate(w, "templates/alreadyRegistered.html", nil)
 		return
 	}
 
 	// XXX set timeout for an account until the user done a device registration
-	subject, err = makeSubject(ctx.Email)
+	account, err = makeAccount(ctx.Email)
 	if err != nil {
-		internalError(w, fmt.Errorf("Error getting subject for email %s: %s", ctx.Email, err))
+		internalError(w, fmt.Errorf("Error getting account for email %s: %s", ctx.Email, err))
 		return
 	}
 
-	showDeviceRegistrationForm(w, r, subject)
+	showDeviceRegistrationForm(w, r, account)
 }
 
-func showDeviceRegistrationForm(w http.ResponseWriter, r *http.Request, subject string) {
-	id, err := storeDeviceRegistrationContext(subject)
+func showDeviceRegistrationForm(w http.ResponseWriter, r *http.Request, account string) {
+	id, err := storeDeviceRegistrationContext(account)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -465,13 +465,13 @@ func showDeviceRegistrationForm(w http.ResponseWriter, r *http.Request, subject 
 	})
 }
 
-func storeDeviceRegistrationContext(subject string) (string, error) {
+func storeDeviceRegistrationContext(account string) (string, error) {
 	var id, key string
 	for {
 		id = ksuid.New().String()
 		key = "device-register-context:" + id
 		b, err := json.Marshal(DeviceRegistrationContext{
-			Subject: subject,
+			Account: account,
 		})
 		if err != nil {
 			return "", err
@@ -554,10 +554,10 @@ func deviceRegistrationVerifyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deviceID, err := registerDevice(ctx.Subject, label, address, publicKey)
+	deviceID, err := registerDevice(ctx.Account, label, address, publicKey)
 	if err != nil {
 		if err == AlreadyRegisteredError {
-			log.Printf("Device already registered: publicKey=%q, account=%q", publicKey, ctx.Subject)
+			log.Printf("Device already registered: publicKey=%q, account=%q", publicKey, ctx.Account)
 			http.Error(w, "Device already registered", http.StatusConflict)
 		} else {
 			internalError(w, err)
@@ -805,29 +805,29 @@ func rejectConsent(w http.ResponseWriter, r *http.Request, challenge, subject st
 	http.Redirect(w, r, v.RedirectTo, http.StatusFound)
 }
 
-func getSubjectFromEmail(email string) (subject string, err error) {
-	subject, err = redisClient.Get("email2subject:" + email).Result()
+func getAccountFromEmail(email string) (account string, err error) {
+	account, err = redisClient.Get("email2account:" + email).Result()
 	return
 }
 
-func getEmailFromSubject(subject string) (email string, err error) {
-	email, err = redisClient.Get("subject2email:" + subject).Result()
+func getEmailFromAccount(account string) (email string, err error) {
+	email, err = redisClient.Get("account2email:" + account).Result()
 	return
 }
 
-func makeSubject(email string) (subject string, err error) {
+func makeAccount(email string) (account string, err error) {
 	id := ksuid.New().String()
 	var ok bool
-	ok, err = redisClient.SetNX("email2subject:"+email, id, 0).Result()
+	ok, err = redisClient.SetNX("email2account:"+email, id, 0).Result()
 	if err != nil {
 		return
 	}
 	if ok {
-		subject = id
-		_, err = redisClient.Set("subject2email:"+subject, email, 0).Result()
-		// TODO remove email2subject if err
+		account = id
+		_, err = redisClient.Set("account2email:"+account, email, 0).Result()
+		// TODO remove email2account if err
 	} else {
-		subject, err = getSubjectFromEmail(email)
+		account, err = getAccountFromEmail(email)
 	}
 
 	return
@@ -923,7 +923,7 @@ func registrationDoneHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	devices, err := getAccountDevices(ctx.Subject)
+	devices, err := getAccountDevices(ctx.Account)
 	if err != nil {
 		internalError(w, err)
 		return
