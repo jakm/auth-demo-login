@@ -89,6 +89,10 @@ type DeviceInfo struct {
 	PublicKey string `json:"public_key"`
 }
 
+type LoginContext struct {
+	Challenge string `json:"challenge"`
+}
+
 func init() {
 	err := config.Load()
 	if err != nil {
@@ -114,19 +118,17 @@ func init() {
 func main() {
 	router := mux.NewRouter().StrictSlash(true)
 
-	router.HandleFunc("/login", loginHandler)
-	router.HandleFunc("/consent", consentHandler)
-	router.HandleFunc("/callback", callbackHandler)
-	router.HandleFunc("/register", registerHandler)
-	router.HandleFunc("/register/confirm/{id}", confirmRegistrationHandler)
-	router.HandleFunc("/register/device", func(w http.ResponseWriter, r *http.Request) {
-		showDeviceRegistrationForm(w, r, "1CqXopIH58oDaWqH8lVFDz1UYpR")
-	})
-	router.HandleFunc("/register/device/{challenge}", deviceRegistrationChallengeHandler)
-	router.HandleFunc("/register/device/verify/{challenge}", deviceRegistrationVerifyHandler)
-	router.HandleFunc("/register/done", registrationDoneHandler)
-	// router.HandleFunc("/reset", resetHandler)
-	// router.HandleFunc("/reset/confirm/{id}", confirmResetHandler)
+	router.HandleFunc("/login", loginHandler).Methods("GET")
+	router.HandleFunc("/login/challenge/{challenge}", loginChallengeHandler).Methods("GET")
+	router.HandleFunc("/login/verify/{challenge}", loginVerifyHandler).Methods("POST")
+	router.HandleFunc("/consent", consentHandler).Methods("GET", "POST")
+	router.HandleFunc("/register", registerHandler).Methods("GET", "POST")
+	router.HandleFunc("/register/confirm/{id}", confirmRegistrationHandler).Methods("GET")
+	router.HandleFunc("/register/device/{challenge}", deviceRegistrationChallengeHandler).Methods("GET")
+	router.HandleFunc("/register/device/verify/{challenge}", deviceRegistrationVerifyHandler).Methods("POST")
+	router.HandleFunc("/register/done", registrationDoneHandler).Methods("POST")
+	// router.HandleFunc("/reset", resetHandler).Methods("GET", "POST")
+	// router.HandleFunc("/reset/confirm/{id}", confirmResetHandler).Methods("GET", "POST")
 
 	router.PathPrefix("/js/").Handler(http.StripPrefix("/js/", http.FileServer(http.Dir("js"))))
 	router.PathPrefix("/css/").Handler(http.StripPrefix("/css/", http.FileServer(http.Dir("css"))))
@@ -155,48 +157,132 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-	// if r.Method == http.MethodPost {
-	// 	err := r.ParseForm()
-	// 	if err != nil {
-	// 		badRequestError(w, fmt.Errorf("Form parsing failed: %s", err))
-	// 		return
-	// 	}
-	// 	email := r.Form.Get("email")
-	// 	challenge := r.Form.Get("challenge")
-	// 	if email == "" || challenge == "" {
-	// 		badRequestError(w, fmt.Errorf("Missing email or challenge in form data"))
-	// 		return
-	// 	}
-	//
-	// 	subject, err := makeSubject(email)
-	// 	if err != nil {
-	// 		internalError(w, fmt.Errorf("Error getting subject for email %s: %s", email, err))
-	// 		return
-	// 	}
-	//
-	// 	sendRegistrationConfirmEmail(w, r, email, challenge, subject)
-	// 	return
-	// }
-	//
-	// challenge := r.URL.Query().Get("login_challenge")
-	// if challenge == "" {
-	// 	badRequestError(w, fmt.Errorf("Missing challenge argument: %s", r.URL.String()))
-	// 	return
-	// }
-	//
-	// v, err := getLoginStatus(challenge)
-	// if err != nil {
-	// 	internalError(w, err)
-	// 	return
-	// }
-	// if v.Skip {
-	// 	// XXX: verify login status in db
-	// 	acceptLogin(w, r, challenge, v.Subject, v.Skip)
-	// 	// rejectLogin(w, r, challenge, v.Subject)
-	// 	return
-	// }
-	//
-	// showLoginForm(w, r, challenge)
+	challenge := r.URL.Query().Get("login_challenge")
+	if challenge == "" {
+		badRequestError(w, fmt.Errorf("Missing challenge argument: %s", r.URL.String()))
+		return
+	}
+
+	v, err := getLoginStatus(challenge)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if v.Skip {
+		// XXX: verify login status in db
+		acceptLogin(w, r, challenge, v.Subject, v.Skip)
+		// rejectLogin(w, r, challenge, v.Subject)
+		return
+	}
+
+	showLoginPage(w, r, challenge)
+}
+
+func loginChallengeHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	challenge := vars["challenge"]
+
+	id := hex.EncodeToString(ksuid.New().Bytes())
+	ctx := LoginContext{Challenge: id}
+	err := storeLoginContext(challenge, &ctx)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	e := json.NewEncoder(w)
+	err = e.Encode(map[string]string{
+		"challengeHidden": id,
+		"challengeVisual": LoginMessage,
+	})
+	if err != nil {
+		log.Println(err)
+	}
+}
+
+func loginVerifyHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	challenge := vars["challenge"]
+
+	err := r.ParseForm()
+	if err != nil {
+		badRequestError(w, err)
+		return
+	}
+
+	address := r.Form.Get("address")
+	publicKey := r.Form.Get("publicKey")
+	signature := r.Form.Get("signature")
+
+	if address == "" || publicKey == "" || signature == "" {
+		badRequestError(w, fmt.Errorf("Invalid parameters: %+v", r.Form))
+		return
+	}
+
+	ctx, err := getLoginContext(challenge)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	log.Printf("login verify params: address=%q, publicKey=%q, signature=%q, challenge=%q",
+		address, publicKey, signature, ctx.Challenge)
+
+	valid, err := verifyTrezorLogin(ctx.Challenge, LoginMessage, publicKey, signature)
+
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	if !valid {
+		log.Printf("Reject login: %s", publicKey)
+		rejectLogin(w, r, challenge)
+		return
+	}
+
+	di, err := getDeviceInfo(publicKey)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	log.Printf("Accept login: device=%s, account=%s", publicKey, di.Account)
+	acceptLogin(w, r, challenge, di.Account, false)
+}
+
+func storeLoginContext(id string, ctx *LoginContext) error {
+	b, err := json.Marshal(ctx)
+	if err != nil {
+		return err
+	}
+
+	key := "login-context:" + id
+	err = redisClient.Set(key, string(b), time.Hour).Err()
+	if err != nil {
+		return fmt.Errorf("Error setting key %s: %s", key, err)
+	}
+
+	return nil
+}
+
+func getLoginContext(id string) (*LoginContext, error) {
+	key := "login-context:" + id
+	s, err := redisClient.Get(key).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, fmt.Errorf("Not found: %s", key)
+		}
+		return nil, err
+	}
+	var v *LoginContext
+	err = json.Unmarshal([]byte(s), &v)
+	if err != nil {
+		return nil, err
+	}
+
+	return v, nil
 }
 
 func consentHandler(w http.ResponseWriter, r *http.Request) {
@@ -251,10 +337,6 @@ func consentHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	showConsentForm(w, r, challenge, email, v)
-}
-
-func callbackHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "Callback")
 }
 
 func internalError(w http.ResponseWriter, err error) {
@@ -329,11 +411,53 @@ func acceptLogin(w http.ResponseWriter, r *http.Request, challenge, subject stri
 		return
 	}
 
-	http.Redirect(w, r, v.RedirectTo, http.StatusFound)
+	w.Header().Set("Content-Type", "application/json")
+	e := json.NewEncoder(w)
+	err = e.Encode(v)
+	if err != nil {
+		log.Println(err)
+	}
 }
 
-func rejectLogin(w http.ResponseWriter, r *http.Request, challenge, subject string) {
+func rejectLogin(w http.ResponseWriter, r *http.Request, challenge string) {
+	log.Println("Login rejected:", challenge)
 
+	b, err := json.Marshal(RejectReq{
+		Error:      "authentication_failure",
+		ErrorDescr: "Provided device doesn't match any account",
+	})
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	url := config.Hydra.LoginURL + challenge + "/reject"
+	res, err := putJSON(url, b)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		internalError(w, fmt.Errorf("Request failed: %s: %s", url, res.Status))
+		return
+	}
+
+	var v RedirectRes
+	d := json.NewDecoder(res.Body)
+	err = d.Decode(&v)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	e := json.NewEncoder(w)
+	err = e.Encode(v)
+	if err != nil {
+		log.Println(err)
+	}
 }
 
 func executeTemplate(w http.ResponseWriter, templatePath string, data map[string]interface{}) {
@@ -346,8 +470,8 @@ func executeTemplate(w http.ResponseWriter, templatePath string, data map[string
 	}
 }
 
-func showLoginForm(w http.ResponseWriter, r *http.Request, challenge string) {
-	executeTemplate(w, "templates/loginForm.html", map[string]interface{}{"challenge": challenge})
+func showLoginPage(w http.ResponseWriter, r *http.Request, challenge string) {
+	executeTemplate(w, "templates/login.html", map[string]interface{}{"challenge": challenge})
 }
 
 func showRegistrationForm(w http.ResponseWriter, r *http.Request) {
@@ -539,7 +663,7 @@ func deviceRegistrationVerifyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("PARAMS: label=%q, address=%q, publicKey=%q, signature=%q, challenge=%q",
+	log.Printf("registration verify params: label=%q, address=%q, publicKey=%q, signature=%q, challenge=%q",
 		label, address, publicKey, signature, ctx.Challenge)
 
 	valid, err := verifyTrezorLogin(ctx.Challenge, LoginMessage, publicKey, signature)
@@ -791,12 +915,12 @@ func rejectConsent(w http.ResponseWriter, r *http.Request, challenge, subject st
 
 	if res.StatusCode != http.StatusOK {
 		internalError(w, fmt.Errorf("Request failed: %s: %s", url, res.Status))
+		return
 	}
 
 	var v RedirectRes
 	d := json.NewDecoder(res.Body)
 	err = d.Decode(&v)
-	err = json.Unmarshal(b, &v)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -805,14 +929,26 @@ func rejectConsent(w http.ResponseWriter, r *http.Request, challenge, subject st
 	http.Redirect(w, r, v.RedirectTo, http.StatusFound)
 }
 
-func getAccountFromEmail(email string) (account string, err error) {
-	account, err = redisClient.Get("email2account:" + email).Result()
-	return
+func getAccountFromEmail(email string) (string, error) {
+	account, err := redisClient.Get("email2account:" + email).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return "", nil
+		}
+		return "", err
+	}
+	return account, nil
 }
 
-func getEmailFromAccount(account string) (email string, err error) {
-	email, err = redisClient.Get("account2email:" + account).Result()
-	return
+func getEmailFromAccount(account string) (string, error) {
+	email, err := redisClient.Get("account2email:" + account).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return "", nil
+		}
+		return "", err
+	}
+	return email, nil
 }
 
 func makeAccount(email string) (account string, err error) {
