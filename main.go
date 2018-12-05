@@ -248,6 +248,12 @@ func loginVerifyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if di == nil {
+		log.Printf("Reject login: device=%s", publicKey)
+		rejectLogin(w, r, challenge)
+		return
+	}
+
 	log.Printf("Accept login: device=%s, account=%s", publicKey, di.Account)
 	acceptLogin(w, r, challenge, di.Account, false)
 }
