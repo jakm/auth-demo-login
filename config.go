@@ -27,6 +27,9 @@ type Config struct {
 		LoginURL   string `yaml:"login_url"   env:"HYDRA_LOGIN_URL"`
 		ConsentURL string `yaml:"consent_url" env:"HYDRA_CONSENT_URL"`
 	} `yaml:"hydra"`
+	Keto struct {
+		PoliciesURL string `yaml:"policies_url" env:"KETO_POLICIES_URL"`
+	} `yaml:"keto"`
 	LoginPage struct {
 		Title string `yaml:"title" env:"LOGIN_PAGE_TITLE"`
 		URL   string `yaml:"url"   env:"LOGIN_PAGE_URL"`

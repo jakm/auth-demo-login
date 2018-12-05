@@ -93,6 +93,15 @@ type LoginContext struct {
 	Challenge string `json:"challenge"`
 }
 
+type ACLPolicy struct {
+	ID         string   `json:"id"`
+	Subjects   []string `json:"subjects"`
+	Resources  []string `json:"resources"`
+	Actions    []string `json:"actions"`
+	Conditions struct{} `json:"conditions"`
+	Effect     string   `json:"effect"`
+}
+
 func init() {
 	err := config.Load()
 	if err != nil {
@@ -390,14 +399,9 @@ func acceptLogin(w http.ResponseWriter, r *http.Request, challenge, subject stri
 		req.Remember = true
 		req.RememberFor = halfYear
 	}
-	b, err := json.Marshal(req)
-	if err != nil {
-		internalError(w, err)
-		return
-	}
 
 	url := config.Hydra.LoginURL + challenge + "/accept"
-	res, err := putJSON(url, b)
+	res, err := putJSON(url, req)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -428,17 +432,13 @@ func acceptLogin(w http.ResponseWriter, r *http.Request, challenge, subject stri
 func rejectLogin(w http.ResponseWriter, r *http.Request, challenge string) {
 	log.Println("Login rejected:", challenge)
 
-	b, err := json.Marshal(RejectReq{
+	req := RejectReq{
 		Error:      "authentication_failure",
 		ErrorDescr: "Provided device doesn't match any account",
-	})
-	if err != nil {
-		internalError(w, err)
-		return
 	}
 
 	url := config.Hydra.LoginURL + challenge + "/reject"
-	res, err := putJSON(url, b)
+	res, err := putJSON(url, req)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -805,13 +805,37 @@ func updateDeviceRegisterContext(id string, updateFn func(*DeviceRegistrationCon
 	return redisClient.Set(key, string(b), ttl).Err()
 }
 
-func putJSON(url string, body []byte) (*http.Response, error) {
-	req, err := http.NewRequest("PUT", url, bytes.NewReader(body))
+func putJSON(url string, v interface{}) (*http.Response, error) {
+	b, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Add("Content-Type", "application/json")
-	req.ContentLength = int64(len(body))
+
+	req, err := http.NewRequest("PUT", url, bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(b))
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+func postJSON(url string, v interface{}) (*http.Response, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(b))
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -869,14 +893,9 @@ LOOP:
 		req.Remember = true
 		req.RememberFor = halfYear
 	}
-	b, err := json.Marshal(req)
-	if err != nil {
-		internalError(w, err)
-		return
-	}
 
 	url := config.Hydra.ConsentURL + challenge + "/accept"
-	res, err := putJSON(url, b)
+	res, err := putJSON(url, req)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -902,17 +921,13 @@ LOOP:
 func rejectConsent(w http.ResponseWriter, r *http.Request, challenge, subject string) {
 	log.Println("Consent rejected:", challenge, subject)
 
-	b, err := json.Marshal(RejectReq{
+	req := RejectReq{
 		Error:      "access_denied",
 		ErrorDescr: "The resource owner denied the request",
-	})
-	if err != nil {
-		internalError(w, err)
-		return
 	}
 
 	url := config.Hydra.ConsentURL + challenge + "/reject"
-	res, err := putJSON(url, b)
+	res, err := putJSON(url, req)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -1089,8 +1104,54 @@ func registrationDoneHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	email, err := getEmailFromAccount(ctx.Account)
+	if err != nil {
+		internalError(w, fmt.Errorf("Partially created account: account=%q err=%q", ctx.Account, err))
+		return
+	}
+
+	err = registerACLPolicies(ctx.Account, email)
+	if err != nil {
+		internalError(w, fmt.Errorf("Partially created account: account=%q err=%q", ctx.Account, err))
+		return
+	}
+
 	executeTemplate(w, "templates/registrationDone.html", map[string]interface{}{
 		"login_title": config.LoginPage.Title,
 		"login_url":   config.LoginPage.URL,
 	})
+}
+
+func registerACLPolicies(account, email string) error {
+	// TODO this code is just a demo, in production, there should be a dedicated service that will
+	// fulfill business requirements for ACL (e.g. (un)subscription, expiration, default scopes...)
+	for _, scope := range []string{"wallet", "demo"} {
+		p := ACLPolicy{
+			ID: fmt.Sprintf("policy:%s:%s", scope, account),
+			Subjects: []string{
+				email,
+			},
+			Resources: []string{
+				fmt.Sprintf("%s:%s:<.+>", scope, account),
+			},
+			Actions: []string{
+				fmt.Sprintf("%s:action:%s", scope, "create"),
+				fmt.Sprintf("%s:action:%s", scope, "delete"),
+				fmt.Sprintf("%s:action:%s", scope, "read"),
+				fmt.Sprintf("%s:action:%s", scope, "modify"),
+				fmt.Sprintf("%s:action:%s", scope, "list"),
+			},
+			Effect: "allow",
+		}
+
+		res, err := postJSON(config.Keto.PoliciesURL, &p)
+		if err != nil {
+			return err
+		}
+		if res.StatusCode != http.StatusCreated {
+			return fmt.Errorf("Request failed: %s", res.Status)
+		}
+	}
+
+	return nil
 }
