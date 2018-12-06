@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -14,12 +15,14 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ascarter/requestid"
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/go-redis/redis"
 	"github.com/gorilla/mux"
 	"github.com/segmentio/ksuid"
+	"go.uber.org/zap"
 )
 
 const halfYear = 6 * 30 * 24 * 3600
@@ -28,10 +31,15 @@ const LoginMessage = "Login to Trezor Cloud"
 
 var (
 	config      = Config{}
+	logger      *zap.Logger
 	redisClient *redis.Client
 )
 
 var AlreadyRegisteredError = errors.New("Already registered")
+
+type contextKey string
+
+var lgrKey = contextKey("lgr")
 
 type LoginStatusRes struct {
 	Skip    bool   `json:"skip"`
@@ -103,28 +111,28 @@ type ACLPolicy struct {
 }
 
 func init() {
-	err := config.Load()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	log.Printf("%+v", config)
-
-	redisClient = redis.NewClient(&redis.Options{
-		Addr:     config.Redis.Addr,
-		Password: config.Redis.Password,
-		DB:       config.Redis.DB,
-	})
-
-	_, err = redisClient.Ping().Result()
-	if err != nil {
-		log.Fatalf("Redis connection failed: %s", err)
-	}
-
 	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 }
 
 func main() {
+	logger, err := zap.NewDevelopment()
+	if err != nil {
+		log.Fatalf("can't initialize zap logger: %v", err)
+	}
+	defer logger.Sync()
+
+	err = config.Load()
+	if err != nil {
+		logger.Fatal("loading config", zap.Error(err))
+	}
+
+	logger.Debug("config loaded", zap.Any("config", config))
+
+	redisClient, err = connectRedis(&config)
+	if err != nil {
+		logger.Fatal("connecting Redis", zap.Error(err))
+	}
+
 	router := mux.NewRouter().StrictSlash(true)
 
 	router.HandleFunc("/login", loginHandler).Methods("GET")
@@ -142,62 +150,120 @@ func main() {
 	router.PathPrefix("/js/").Handler(http.StripPrefix("/js/", http.FileServer(http.Dir("js"))))
 	router.PathPrefix("/css/").Handler(http.StripPrefix("/css/", http.FileServer(http.Dir("css"))))
 
+	router.Use(requestid.RequestIDHandler)
+	router.Use(loggingMiddleware(logger))
+
 	http.ListenAndServeTLS(config.ListenAddr, "cert/server.crt", "cert/server.key", router)
 }
 
+func connectRedis(config *Config) (*redis.Client, error) {
+	cli := redis.NewClient(&redis.Options{
+		Addr:     config.Redis.Addr,
+		Password: config.Redis.Password,
+		DB:       config.Redis.DB,
+	})
+
+	_, err := cli.Ping().Result()
+	if err != nil {
+		return nil, err
+	}
+
+	return cli, nil
+}
+
+func loggingMiddleware(logger *zap.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rid, _ := requestid.FromContext(r.Context())
+			lgr := logger.With(zap.String("request_id", rid))
+			lgr.Info("http request", zap.String("method", r.Method), zap.String("url", r.URL.String()))
+			if ce := lgr.Check(zap.DebugLevel, "http request"); ce != nil {
+				ce.Write(
+					zap.String("proto", r.Proto),
+					zap.String("host", r.Host),
+					zap.String("remote_addr", r.RemoteAddr),
+					zap.String("request_uri", r.RequestURI),
+					zap.Any("header", r.Header),
+				)
+			}
+			ctx := context.WithValue(r.Context(), lgrKey, lgr)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+func getLogger(r *http.Request) *zap.Logger {
+	v := r.Context().Value(lgrKey)
+	if v != nil {
+		return v.(*zap.Logger)
+	}
+	logger.Warn("missing logger in context", zap.String("method", r.Method), zap.String("url", r.URL.String()))
+	return logger
+}
+
 func registerHandler(w http.ResponseWriter, r *http.Request) {
+	lgr := getLogger(r)
+
 	if r.Method == http.MethodPost {
 		err := r.ParseForm()
 		if err != nil {
-			badRequestError(w, fmt.Errorf("Form parsing failed: %s", err))
+			badRequestError(w, lgr, fmt.Errorf("Form parsing failed: %s", err))
 			return
 		}
 		email := r.Form.Get("email")
 		if email == "" {
-			badRequestError(w, fmt.Errorf("Invalid parameters: %+v", r.Form))
+			badRequestError(w, lgr, fmt.Errorf("Invalid parameters: %+v", r.Form))
 			return
 		}
 
-		sendRegistrationEmail(w, r, email)
+		sendRegistrationEmail(w, r, lgr, email)
 		return
 	}
 
-	showRegistrationForm(w, r)
+	showRegistrationForm(w, r, lgr)
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
+	lgr := getLogger(r)
+
 	challenge := r.URL.Query().Get("login_challenge")
 	if challenge == "" {
-		badRequestError(w, fmt.Errorf("Missing challenge argument: %s", r.URL.String()))
+		badRequestError(w, lgr, fmt.Errorf("Missing challenge argument: %s", r.URL.String()))
 		return
 	}
 
+	lgr = lgr.With(zap.String("challenge", challenge))
+
 	v, err := getLoginStatus(challenge)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 	if v.Skip {
-		// XXX: verify login status in db
-		acceptLogin(w, r, challenge, v.Subject, v.Skip)
+		// XXX: verify login status in db, business logic...
+		acceptLogin(w, r, lgr, challenge, v.Subject, v.Skip)
 		// rejectLogin(w, r, challenge, v.Subject)
 		return
 	}
 
-	showLoginPage(w, r, challenge)
+	showLoginPage(w, r, lgr, challenge)
 }
 
 func loginChallengeHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	challenge := vars["challenge"]
 
+	lgr := getLogger(r).With(zap.String("challenge", challenge))
+
 	id := hex.EncodeToString(ksuid.New().Bytes())
 	ctx := LoginContext{Challenge: id}
 	err := storeLoginContext(challenge, &ctx)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
+
+	lgr.Info("new login context", zap.String("dev_challenge", id))
 
 	w.Header().Set("Content-Type", "application/json")
 	e := json.NewEncoder(w)
@@ -206,7 +272,7 @@ func loginChallengeHandler(w http.ResponseWriter, r *http.Request) {
 		"challengeVisual": LoginMessage,
 	})
 	if err != nil {
-		log.Println(err)
+		lgr.Error("response write", zap.Error(err))
 	}
 }
 
@@ -214,9 +280,11 @@ func loginVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	challenge := vars["challenge"]
 
+	lgr := getLogger(r).With(zap.String("challenge", challenge))
+
 	err := r.ParseForm()
 	if err != nil {
-		badRequestError(w, err)
+		badRequestError(w, lgr, err)
 		return
 	}
 
@@ -225,46 +293,49 @@ func loginVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	signature := r.Form.Get("signature")
 
 	if address == "" || publicKey == "" || signature == "" {
-		badRequestError(w, fmt.Errorf("Invalid parameters: %+v", r.Form))
+		badRequestError(w, lgr, fmt.Errorf("Invalid parameters: %+v", r.Form))
 		return
 	}
 
 	ctx, err := getLoginContext(challenge)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
-	log.Printf("login verify params: address=%q, publicKey=%q, signature=%q, challenge=%q",
-		address, publicKey, signature, ctx.Challenge)
+	if ce := lgr.Check(zap.DebugLevel, "params"); ce != nil {
+		ce.Write(
+			zap.String("address", address),
+			zap.String("publicKey", publicKey),
+			zap.String("signature", signature),
+		)
+	}
 
 	valid, err := verifyTrezorLogin(ctx.Challenge, LoginMessage, publicKey, signature)
 
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
 	if !valid {
-		log.Printf("Reject login: %s", publicKey)
-		rejectLogin(w, r, challenge)
+		lgr.Warn("device invalid", zap.String("address", address), zap.String("publicKey", publicKey), zap.String("signature", signature))
+		rejectLogin(w, r, lgr, challenge)
 		return
 	}
 
 	di, err := getDeviceInfo(publicKey)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
 	if di == nil {
-		log.Printf("Reject login: device=%s", publicKey)
-		rejectLogin(w, r, challenge)
+		rejectLogin(w, r, lgr, challenge)
 		return
 	}
 
-	log.Printf("Accept login: device=%s, account=%s", publicKey, di.Account)
-	acceptLogin(w, r, challenge, di.Account, false)
+	acceptLogin(w, r, lgr, challenge, di.Account, false)
 }
 
 func storeLoginContext(id string, ctx *LoginContext) error {
@@ -301,17 +372,19 @@ func getLoginContext(id string) (*LoginContext, error) {
 }
 
 func consentHandler(w http.ResponseWriter, r *http.Request) {
+	lgr := getLogger(r)
+
 	if r.Method == http.MethodPost {
 		err := r.ParseForm()
 		if err != nil {
-			badRequestError(w, fmt.Errorf("Form parsing failed: %s", err))
+			badRequestError(w, lgr, fmt.Errorf("Form parsing failed: %s", err))
 			return
 		}
 		challenge := r.Form.Get("challenge")
 		subject := r.Form.Get("subject")
 		email := r.Form.Get("email")
 		if challenge == "" || subject == "" || email == "" {
-			badRequestError(w, fmt.Errorf("Missing field in form data"))
+			badRequestError(w, lgr, fmt.Errorf("Missing field in form data"))
 			return
 		}
 		grantScope := r.Form["grant_scope"]
@@ -320,10 +393,12 @@ func consentHandler(w http.ResponseWriter, r *http.Request) {
 			accessGranted = true
 		}
 
+		lgr = lgr.With(zap.String("challenge", challenge), zap.String("subject", subject))
+
 		if !accessGranted {
-			rejectConsent(w, r, challenge, subject)
+			rejectConsent(w, r, lgr, challenge, subject)
 		} else {
-			acceptConsent(w, r, challenge, subject, email, false, grantScope)
+			acceptConsent(w, r, lgr, challenge, subject, email, false, grantScope)
 		}
 
 		return
@@ -331,36 +406,40 @@ func consentHandler(w http.ResponseWriter, r *http.Request) {
 
 	challenge := r.URL.Query().Get("consent_challenge")
 	if challenge == "" {
-		badRequestError(w, fmt.Errorf("Missing challenge argument: %s", r.URL.String()))
+		badRequestError(w, lgr, fmt.Errorf("Missing challenge argument: %s", r.URL.String()))
 		return
 	}
+
+	lgr = lgr.With(zap.String("challenge", challenge))
 
 	v, err := getConsentStatus(challenge)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
+	lgr = lgr.With(zap.String("subject", v.Subject))
+
 	email, err := getEmailFromAccount(v.Subject)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
 	if v.Skip {
-		acceptConsent(w, r, challenge, v.Subject, email, v.Skip, v.RequestedScope)
+		acceptConsent(w, r, lgr, challenge, v.Subject, email, v.Skip, v.RequestedScope)
 	}
 
-	showConsentForm(w, r, challenge, email, v)
+	showConsentForm(w, r, lgr, challenge, email, v)
 }
 
-func internalError(w http.ResponseWriter, err error) {
-	log.Print(err)
+func internalError(w http.ResponseWriter, lgr *zap.Logger, err error) {
+	lgr.Error("internal server error", zap.Error(err))
 	http.Error(w, "Internal server error", http.StatusInternalServerError)
 }
 
-func badRequestError(w http.ResponseWriter, err error) {
-	log.Print(err)
+func badRequestError(w http.ResponseWriter, lgr *zap.Logger, err error) {
+	lgr.Error("bad request", zap.Error(err))
 	http.Error(w, "Bad request", http.StatusBadRequest)
 }
 
@@ -389,8 +468,8 @@ func getLoginStatus(challenge string) (v LoginStatusRes, err error) {
 	return
 }
 
-func acceptLogin(w http.ResponseWriter, r *http.Request, challenge, subject string, skip bool) {
-	log.Println("Login accepted:", challenge, subject)
+func acceptLogin(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, challenge, subject string, skip bool) {
+	lgr.Debug("accept login", zap.String("subject", subject))
 
 	req := LoginAcceptReq{
 		Subject: subject,
@@ -403,13 +482,13 @@ func acceptLogin(w http.ResponseWriter, r *http.Request, challenge, subject stri
 	url := config.Hydra.LoginURL + challenge + "/accept"
 	res, err := putJSON(url, req)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		internalError(w, fmt.Errorf("Request failed: %s: %s", url, res.Status))
+		internalError(w, lgr, fmt.Errorf("Request failed: %s: %s", url, res.Status))
 		return
 	}
 
@@ -417,7 +496,7 @@ func acceptLogin(w http.ResponseWriter, r *http.Request, challenge, subject stri
 	d := json.NewDecoder(res.Body)
 	err = d.Decode(&v)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
@@ -425,12 +504,12 @@ func acceptLogin(w http.ResponseWriter, r *http.Request, challenge, subject stri
 	e := json.NewEncoder(w)
 	err = e.Encode(v)
 	if err != nil {
-		log.Println(err)
+		lgr.Error("response write", zap.Error(err))
 	}
 }
 
-func rejectLogin(w http.ResponseWriter, r *http.Request, challenge string) {
-	log.Println("Login rejected:", challenge)
+func rejectLogin(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, challenge string) {
+	lgr.Debug("reject login")
 
 	req := RejectReq{
 		Error:      "authentication_failure",
@@ -440,13 +519,13 @@ func rejectLogin(w http.ResponseWriter, r *http.Request, challenge string) {
 	url := config.Hydra.LoginURL + challenge + "/reject"
 	res, err := putJSON(url, req)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		internalError(w, fmt.Errorf("Request failed: %s: %s", url, res.Status))
+		internalError(w, lgr, fmt.Errorf("Request failed: %s: %s", url, res.Status))
 		return
 	}
 
@@ -454,7 +533,7 @@ func rejectLogin(w http.ResponseWriter, r *http.Request, challenge string) {
 	d := json.NewDecoder(res.Body)
 	err = d.Decode(&v)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
@@ -462,29 +541,29 @@ func rejectLogin(w http.ResponseWriter, r *http.Request, challenge string) {
 	e := json.NewEncoder(w)
 	err = e.Encode(v)
 	if err != nil {
-		log.Println(err)
+		lgr.Error("response write", zap.Error(err))
 	}
 }
 
-func executeTemplate(w http.ResponseWriter, templatePath string, data map[string]interface{}) {
+func executeTemplate(w http.ResponseWriter, lgr *zap.Logger, templatePath string, data map[string]interface{}) {
 	t, err := template.ParseFiles(templatePath)
 	if err == nil {
 		err = t.Execute(w, data)
 	}
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 	}
 }
 
-func showLoginPage(w http.ResponseWriter, r *http.Request, challenge string) {
-	executeTemplate(w, "templates/login.html", map[string]interface{}{"challenge": challenge})
+func showLoginPage(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, challenge string) {
+	executeTemplate(w, lgr, "templates/login.html", map[string]interface{}{"challenge": challenge})
 }
 
-func showRegistrationForm(w http.ResponseWriter, r *http.Request) {
-	executeTemplate(w, "templates/registrationForm.html", nil)
+func showRegistrationForm(w http.ResponseWriter, r *http.Request, lgr *zap.Logger) {
+	executeTemplate(w, lgr, "templates/registrationForm.html", nil)
 }
 
-func showConsentForm(w http.ResponseWriter, r *http.Request, challenge, email string, consent ConsentStatusRes) {
+func showConsentForm(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, challenge, email string, consent ConsentStatusRes) {
 	scope := []string{}
 LOOP:
 	for _, s := range consent.RequestedScope {
@@ -496,7 +575,7 @@ LOOP:
 		scope = append(scope, s)
 	}
 
-	executeTemplate(w, "templates/consentForm.html", map[string]interface{}{
+	executeTemplate(w, lgr, "templates/consentForm.html", map[string]interface{}{
 		"challenge":      challenge,
 		"subject":        consent.Subject,
 		"email":          email,
@@ -505,18 +584,23 @@ LOOP:
 	})
 }
 
-func sendRegistrationEmail(w http.ResponseWriter, r *http.Request, email string) {
+func sendRegistrationEmail(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, email string) {
 	id, err := storeAccountRegistrationContext(email)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
+	lgr.Info("new registration context", zap.String("email", email), zap.String("registration_id", id))
+
 	subject := "Please Verify Your Email Address"
 	req := NewRequest([]string{email}, subject)
-	req.Send("templates/registrationEmail.html", map[string]string{"confirmLink": config.ConfirmLink + id})
+	err = req.Send("templates/registrationEmail.html", map[string]string{"confirmLink": config.ConfirmLink + id})
+	if err != nil {
+		lgr.Error("email send", zap.Error(err))
+	}
 
-	executeTemplate(w, "templates/registrationEmailSent.html", nil)
+	executeTemplate(w, lgr, "templates/registrationEmailSent.html", nil)
 }
 
 func storeAccountRegistrationContext(email string) (string, error) {
@@ -546,51 +630,55 @@ func confirmRegistrationHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
 
+	lgr := getLogger(r).With(zap.String("registration_id", id))
+
 	s, err := redisClient.Get("account-registration-context:" + id).Result()
 	if err != nil {
 		if err == redis.Nil {
-			executeTemplate(w, "templates/linkExpired.html", nil)
+			executeTemplate(w, lgr, "templates/linkExpired.html", nil)
 			return
 		}
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 	var ctx AccountRegistrationContext
 	err = json.Unmarshal([]byte(s), &ctx)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
 	account, err := getAccountFromEmail(ctx.Email)
 	if err != nil {
-		internalError(w, fmt.Errorf("Error getting account for email %s: %s", ctx.Email, err))
+		internalError(w, lgr, fmt.Errorf("Error getting account for email %s: %s", ctx.Email, err))
 		return
 	}
 	if account != "" {
-		log.Printf("Account already registered: email=%s, id=%s", ctx.Email, account)
-		executeTemplate(w, "templates/alreadyRegistered.html", nil)
+		lgr.Warn("account already registered", zap.String("email", ctx.Email), zap.String("account", account))
+		executeTemplate(w, lgr, "templates/alreadyRegistered.html", nil)
 		return
 	}
 
 	// XXX set timeout for an account until the user done a device registration
 	account, err = makeAccount(ctx.Email)
 	if err != nil {
-		internalError(w, fmt.Errorf("Error getting account for email %s: %s", ctx.Email, err))
+		internalError(w, lgr, fmt.Errorf("Error getting account for email %s: %s", ctx.Email, err))
 		return
 	}
 
-	showDeviceRegistrationForm(w, r, account)
+	showDeviceRegistrationForm(w, r, lgr, account)
 }
 
-func showDeviceRegistrationForm(w http.ResponseWriter, r *http.Request, account string) {
+func showDeviceRegistrationForm(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, account string) {
 	id, err := storeDeviceRegistrationContext(account)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
-	executeTemplate(w, "templates/deviceRegisterForm.html", map[string]interface{}{
+	lgr.Info("new device registration context", zap.String("account", account), zap.String("challenge", id))
+
+	executeTemplate(w, lgr, "templates/deviceRegisterForm.html", map[string]interface{}{
 		"challenge": id,
 	})
 }
@@ -624,11 +712,13 @@ func deviceRegistrationChallengeHandler(w http.ResponseWriter, r *http.Request) 
 
 	id := hex.EncodeToString(ksuid.New().Bytes())
 
+	lgr := getLogger(r).With(zap.String("challenge", challenge), zap.String("dev_challenge", id))
+
 	err := updateDeviceRegisterContext(challenge, func(ctx *DeviceRegistrationContext) {
 		ctx.Challenge = id
 	})
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
@@ -639,7 +729,7 @@ func deviceRegistrationChallengeHandler(w http.ResponseWriter, r *http.Request) 
 		"challengeVisual": LoginMessage,
 	})
 	if err != nil {
-		log.Println(err)
+		lgr.Error("response write", zap.Error(err))
 	}
 }
 
@@ -647,9 +737,11 @@ func deviceRegistrationVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	challenge := vars["challenge"]
 
+	lgr := getLogger(r).With(zap.String("challenge", challenge))
+
 	err := r.ParseForm()
 	if err != nil {
-		badRequestError(w, err)
+		badRequestError(w, lgr, err)
 		return
 	}
 
@@ -659,27 +751,36 @@ func deviceRegistrationVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	signature := r.Form.Get("signature")
 
 	if label == "" || address == "" || publicKey == "" || signature == "" {
-		badRequestError(w, fmt.Errorf("Invalid parameters: %+v", r.Form))
+		badRequestError(w, lgr, fmt.Errorf("Invalid parameters: %+v", r.Form))
 		return
 	}
 
 	ctx, err := getDeviceRegisterContext(challenge)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
-	log.Printf("registration verify params: label=%q, address=%q, publicKey=%q, signature=%q, challenge=%q",
-		label, address, publicKey, signature, ctx.Challenge)
+	lgr = lgr.With(zap.String("account", ctx.Account), zap.String("dev_challenge", ctx.Challenge))
+
+	if ce := lgr.Check(zap.DebugLevel, "params"); ce != nil {
+		ce.Write(
+			zap.String("label", label),
+			zap.String("address", address),
+			zap.String("publicKey", publicKey),
+			zap.String("signature", signature),
+		)
+	}
 
 	valid, err := verifyTrezorLogin(ctx.Challenge, LoginMessage, publicKey, signature)
 
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
 	if !valid {
+		lgr.Warn("device invalid", zap.String("address", address), zap.String("publicKey", publicKey), zap.String("signature", signature))
 		http.Error(w, "Device verification failed", http.StatusForbidden)
 		return
 	}
@@ -687,10 +788,10 @@ func deviceRegistrationVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	deviceID, err := registerDevice(ctx.Account, label, address, publicKey)
 	if err != nil {
 		if err == AlreadyRegisteredError {
-			log.Printf("Device already registered: publicKey=%q, account=%q", publicKey, ctx.Account)
+			lgr.Warn("device already registered", zap.String("publicKey", publicKey), zap.String("account", ctx.Account))
 			http.Error(w, "Device already registered", http.StatusConflict)
 		} else {
-			internalError(w, err)
+			internalError(w, lgr, err)
 		}
 		return
 	}
@@ -703,7 +804,7 @@ func deviceRegistrationVerifyHandler(w http.ResponseWriter, r *http.Request) {
 		"deviceLabel": label,
 	})
 	if err != nil {
-		log.Println(err)
+		lgr.Error("response write", zap.Error(err))
 	}
 }
 
@@ -870,7 +971,7 @@ func getConsentStatus(challenge string) (v ConsentStatusRes, err error) {
 	return
 }
 
-func acceptConsent(w http.ResponseWriter, r *http.Request, challenge, subject, email string, skip bool, grantScope []string) {
+func acceptConsent(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, challenge, subject, email string, skip bool, grantScope []string) {
 LOOP:
 	for _, s := range config.DefaultScope {
 		for _, s2 := range grantScope {
@@ -881,7 +982,7 @@ LOOP:
 		grantScope = append(grantScope, s)
 	}
 
-	log.Println("Consent accepted:", challenge, subject, grantScope)
+	lgr.Debug("accept consent", zap.String("challenge", challenge), zap.String("subject", subject), zap.Strings("grantScope", grantScope))
 
 	req := ConsentAcceptReq{
 		GrantScope: grantScope,
@@ -897,13 +998,13 @@ LOOP:
 	url := config.Hydra.ConsentURL + challenge + "/accept"
 	res, err := putJSON(url, req)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		internalError(w, fmt.Errorf("Request failed: %s: %s", url, res.Status))
+		internalError(w, lgr, fmt.Errorf("Request failed: %s: %s", url, res.Status))
 		return
 	}
 
@@ -911,15 +1012,15 @@ LOOP:
 	d := json.NewDecoder(res.Body)
 	err = d.Decode(&v)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
 	http.Redirect(w, r, v.RedirectTo, http.StatusFound)
 }
 
-func rejectConsent(w http.ResponseWriter, r *http.Request, challenge, subject string) {
-	log.Println("Consent rejected:", challenge, subject)
+func rejectConsent(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, challenge, subject string) {
+	lgr.Debug("reject consent")
 
 	req := RejectReq{
 		Error:      "access_denied",
@@ -929,13 +1030,13 @@ func rejectConsent(w http.ResponseWriter, r *http.Request, challenge, subject st
 	url := config.Hydra.ConsentURL + challenge + "/reject"
 	res, err := putJSON(url, req)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		internalError(w, fmt.Errorf("Request failed: %s: %s", url, res.Status))
+		internalError(w, lgr, fmt.Errorf("Request failed: %s: %s", url, res.Status))
 		return
 	}
 
@@ -943,7 +1044,7 @@ func rejectConsent(w http.ResponseWriter, r *http.Request, challenge, subject st
 	d := json.NewDecoder(res.Body)
 	err = d.Decode(&v)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
@@ -1061,32 +1162,36 @@ func getAccountDevices(account string) ([]string, error) {
 }
 
 func registrationDoneHandler(w http.ResponseWriter, r *http.Request) {
+	lgr := getLogger(r)
+
 	err := r.ParseForm()
 	if err != nil {
-		badRequestError(w, err)
+		badRequestError(w, lgr, err)
 		return
 	}
 
 	challenge := r.Form.Get("challenge")
-
 	if challenge == "" {
-		badRequestError(w, fmt.Errorf("Invalid parameters: empty challenge"))
+		badRequestError(w, lgr, fmt.Errorf("Invalid parameters: empty challenge"))
 		return
 	}
 
+	lgr = lgr.With(zap.String("challenge", challenge))
+
 	ctx, err := getDeviceRegisterContext(challenge)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
 	devices, err := getAccountDevices(ctx.Account)
 	if err != nil {
-		internalError(w, err)
+		internalError(w, lgr, err)
 		return
 	}
 
 	if len(devices) == 0 {
+		lgr.Warn("no registered device")
 		html := []byte(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1106,17 +1211,19 @@ func registrationDoneHandler(w http.ResponseWriter, r *http.Request) {
 
 	email, err := getEmailFromAccount(ctx.Account)
 	if err != nil {
-		internalError(w, fmt.Errorf("Partially created account: account=%q err=%q", ctx.Account, err))
+		internalError(w, lgr, fmt.Errorf("Partially created account: account=%q err=%q", ctx.Account, err))
 		return
 	}
 
 	err = registerACLPolicies(ctx.Account, email)
 	if err != nil {
-		internalError(w, fmt.Errorf("Partially created account: account=%q err=%q", ctx.Account, err))
+		internalError(w, lgr, fmt.Errorf("Partially created account: account=%q err=%q", ctx.Account, err))
 		return
 	}
 
-	executeTemplate(w, "templates/registrationDone.html", map[string]interface{}{
+	lgr.Info("registration done", zap.String("account", ctx.Account), zap.String("email", email), zap.Strings("devices", devices))
+
+	executeTemplate(w, lgr, "templates/registrationDone.html", map[string]interface{}{
 		"login_title": config.LoginPage.Title,
 		"login_url":   config.LoginPage.URL,
 	})

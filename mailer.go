@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"html/template"
-	"log"
 	"net/smtp"
 )
 
@@ -47,14 +46,10 @@ func (r *Request) sendMail() error {
 	return err
 }
 
-func (r *Request) Send(templateName string, items interface{}) {
+func (r *Request) Send(templateName string, items interface{}) error {
 	err := r.parseTemplate(templateName, items)
-	if err != nil {
-		log.Fatal(err)
+	if err == nil {
+		err = r.sendMail()
 	}
-	if err := r.sendMail(); err == nil {
-		log.Printf("Email has been sent to %s", r.to)
-	} else {
-		log.Printf("Failed to send the email to %s: %s", r.to, err)
-	}
+	return err
 }
