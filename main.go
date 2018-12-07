@@ -41,6 +41,13 @@ type contextKey string
 
 var lgrKey = contextKey("lgr")
 
+type RedirectType int
+
+const (
+	HTTPRedirect RedirectType = iota
+	JSONRedirect
+)
+
 type LoginStatusRes struct {
 	Skip    bool   `json:"skip"`
 	Subject string `json:"subject"`
@@ -241,7 +248,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if v.Skip {
 		// XXX: verify login status in db, business logic...
-		acceptLogin(w, r, lgr, challenge, v.Subject, v.Skip)
+		acceptLogin(w, r, lgr, challenge, v.Subject, v.Skip, HTTPRedirect)
 		// rejectLogin(w, r, challenge, v.Subject)
 		return
 	}
@@ -335,7 +342,7 @@ func loginVerifyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	acceptLogin(w, r, lgr, challenge, di.Account, false)
+	acceptLogin(w, r, lgr, challenge, di.Account, false, JSONRedirect)
 }
 
 func storeLoginContext(id string, ctx *LoginContext) error {
@@ -468,7 +475,7 @@ func getLoginStatus(challenge string) (v LoginStatusRes, err error) {
 	return
 }
 
-func acceptLogin(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, challenge, subject string, skip bool) {
+func acceptLogin(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, challenge, subject string, skip bool, redir RedirectType) {
 	lgr.Debug("accept login", zap.String("subject", subject))
 
 	req := LoginAcceptReq{
@@ -500,11 +507,18 @@ func acceptLogin(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, challe
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	e := json.NewEncoder(w)
-	err = e.Encode(v)
-	if err != nil {
-		lgr.Error("response write", zap.Error(err))
+	switch redir {
+	case HTTPRedirect:
+		http.Redirect(w, r, v.RedirectTo, http.StatusFound)
+	case JSONRedirect:
+		w.Header().Set("Content-Type", "application/json")
+		e := json.NewEncoder(w)
+		err = e.Encode(v)
+		if err != nil {
+			lgr.Error("response write", zap.Error(err))
+		}
+	default:
+		lgr.Error("invalid redirect type", zap.Int("type", int(redir)))
 	}
 }
 
