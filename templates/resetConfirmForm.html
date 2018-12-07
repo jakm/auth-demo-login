@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+  <head>
+  <title>Reset account</title>
+  <meta charset="UTF-8">
+  </head>
+  <body>
+    <h1>Reset account</h1>
+    <p>Do you confirm reset of account <b>{{ .email }}</b>?</p>
+    <p>In the next step all registered devices will be removed and you will be supposed to register new device.</p>
+    <form action="/reset/confirm/{{ .id }}" method="post">
+      <input type="submit" name="submitBtn" value="Allow">
+      <input type="submit" name="submitBtn" value="Deny">
+    </form>
+  </body>
+</html>

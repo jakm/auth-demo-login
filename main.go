@@ -117,6 +117,11 @@ type ACLPolicy struct {
 	Effect     string   `json:"effect"`
 }
 
+type AccountResetContext struct {
+	Account string `json:"account"`
+	Email   string `json:"email"`
+}
+
 func init() {
 	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 }
@@ -151,8 +156,8 @@ func main() {
 	router.HandleFunc("/register/device/{challenge}", deviceRegistrationChallengeHandler).Methods("GET")
 	router.HandleFunc("/register/device/verify/{challenge}", deviceRegistrationVerifyHandler).Methods("POST")
 	router.HandleFunc("/register/done", registrationDoneHandler).Methods("POST")
-	// router.HandleFunc("/reset", resetHandler).Methods("GET", "POST")
-	// router.HandleFunc("/reset/confirm/{id}", confirmResetHandler).Methods("GET", "POST")
+	router.HandleFunc("/reset", resetHandler).Methods("GET", "POST")
+	router.HandleFunc("/reset/confirm/{id}", confirmResetHandler).Methods("GET", "POST")
 
 	router.PathPrefix("/js/").Handler(http.StripPrefix("/js/", http.FileServer(http.Dir("js"))))
 	router.PathPrefix("/css/").Handler(http.StripPrefix("/css/", http.FileServer(http.Dir("css"))))
@@ -577,6 +582,17 @@ func showRegistrationForm(w http.ResponseWriter, r *http.Request, lgr *zap.Logge
 	executeTemplate(w, lgr, "templates/registrationForm.html", nil)
 }
 
+func showResetForm(w http.ResponseWriter, r *http.Request, lgr *zap.Logger) {
+	executeTemplate(w, lgr, "templates/resetForm.html", nil)
+}
+
+func showConfirmResetForm(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, id, email string) {
+	executeTemplate(w, lgr, "templates/resetConfirmForm.html", map[string]interface{}{
+		"id":    id,
+		"email": email,
+	})
+}
+
 func showConsentForm(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, challenge, email string, consent ConsentStatusRes) {
 	scope := []string{}
 LOOP:
@@ -611,10 +627,41 @@ func sendRegistrationEmail(w http.ResponseWriter, r *http.Request, lgr *zap.Logg
 	req := NewRequest([]string{email}, subject)
 	err = req.Send("templates/registrationEmail.html", map[string]string{"confirmLink": config.ConfirmLink + id})
 	if err != nil {
-		lgr.Error("email send", zap.Error(err))
+		lgr.Error("email not send", zap.Error(err))
 	}
 
 	executeTemplate(w, lgr, "templates/registrationEmailSent.html", nil)
+}
+
+func sendResetEmail(w http.ResponseWriter, r *http.Request, lgr *zap.Logger, email string) {
+	account, err := getAccountFromEmail(email)
+	if err != nil {
+		internalError(w, lgr, err)
+		return
+	}
+
+	if account == "" {
+		lgr.Warn("account not found", zap.String("email", email))
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+
+	id, err := storeResetContext(account, email)
+	if err != nil {
+		internalError(w, lgr, err)
+		return
+	}
+
+	lgr.Info("new reset context", zap.String("email", email), zap.String("account", account), zap.String("reset_id", id))
+
+	subject := "Account Reset Verification"
+	req := NewRequest([]string{email}, subject)
+	err = req.Send("templates/resetEmail.html", map[string]string{"confirmLink": config.ResetLink + id})
+	if err != nil {
+		lgr.Error("email not send", zap.Error(err))
+	}
+
+	executeTemplate(w, lgr, "templates/resetEmailSent.html", nil)
 }
 
 func storeAccountRegistrationContext(email string) (string, error) {
@@ -640,6 +687,30 @@ func storeAccountRegistrationContext(email string) (string, error) {
 	return id, nil
 }
 
+func storeResetContext(account, email string) (string, error) {
+	var id, key string
+	for {
+		id = ksuid.New().String()
+		key = "account-reset-context:" + id
+		b, err := json.Marshal(AccountResetContext{
+			Account: account,
+			Email:   email,
+		})
+		if err != nil {
+			return "", err
+		}
+		ok, err := redisClient.SetNX(key, string(b), time.Hour).Result()
+		if err != nil {
+			return "", fmt.Errorf("Error setting key %s: %s", key, err)
+		}
+		if ok {
+			break
+		}
+	}
+
+	return id, nil
+}
+
 func confirmRegistrationHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
@@ -649,7 +720,7 @@ func confirmRegistrationHandler(w http.ResponseWriter, r *http.Request) {
 	s, err := redisClient.Get("account-registration-context:" + id).Result()
 	if err != nil {
 		if err == redis.Nil {
-			executeTemplate(w, lgr, "templates/linkExpired.html", nil)
+			executeTemplate(w, lgr, "templates/registrationLinkExpired.html", nil)
 			return
 		}
 		internalError(w, lgr, err)
@@ -1105,12 +1176,116 @@ func makeAccount(email string) (account string, err error) {
 	return
 }
 
-// func resetHandler(w http.ResponseWriter, r *http.Request) {
-// }
-//
-// func confirmResetHandler(w http.ResponseWriter, r *http.Request) {
-// 	// TODO pro reset pridat expiraci linku
-// }
+func resetHandler(w http.ResponseWriter, r *http.Request) {
+	lgr := getLogger(r)
+
+	if r.Method == http.MethodPost {
+		err := r.ParseForm()
+		if err != nil {
+			badRequestError(w, lgr, fmt.Errorf("Form parsing failed: %s", err))
+			return
+		}
+		email := r.Form.Get("email")
+		if email == "" {
+			badRequestError(w, lgr, fmt.Errorf("Invalid parameters: %+v", r.Form))
+			return
+
+		}
+
+		sendResetEmail(w, r, lgr, email)
+		return
+	}
+
+	showResetForm(w, r, lgr)
+}
+
+func confirmResetHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		confirmResetPostHandler(w, r)
+		return
+	}
+
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	lgr := getLogger(r).With(zap.String("reset_id", id))
+
+	s, err := redisClient.Get("account-reset-context:" + id).Result()
+	if err != nil {
+		if err == redis.Nil {
+			executeTemplate(w, lgr, "templates/resetLinkExpired.html", nil)
+			return
+		}
+		internalError(w, lgr, err)
+		return
+	}
+	var ctx AccountResetContext
+	err = json.Unmarshal([]byte(s), &ctx)
+	if err != nil {
+		internalError(w, lgr, err)
+		return
+	}
+
+	showConfirmResetForm(w, r, lgr, id, ctx.Email)
+}
+
+func confirmResetPostHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	lgr := getLogger(r).With(zap.String("reset_id", id))
+
+	err := r.ParseForm()
+	if err != nil {
+		badRequestError(w, lgr, err)
+		return
+	}
+
+	removeContext := func() {
+		err := redisClient.Del("account-reset-context:" + id).Err()
+		if err != nil {
+			// TODO redis.Nil ???
+			internalError(w, lgr, err)
+			return
+		}
+	}
+
+	if r.Form.Get("submitBtn") != "Allow" {
+		lgr.Info("reset denied")
+		removeContext()
+		http.Redirect(w, r, "https://trezor.io", http.StatusFound) // TODO
+		return
+	}
+	lgr.Info("reset allowed")
+
+	s, err := redisClient.Get("account-reset-context:" + id).Result()
+	if err != nil {
+		if err == redis.Nil {
+			executeTemplate(w, lgr, "templates/resetLinkExpired.html", nil)
+			return
+		}
+		internalError(w, lgr, err)
+		return
+	}
+	var ctx AccountResetContext
+	err = json.Unmarshal([]byte(s), &ctx)
+	if err != nil {
+		internalError(w, lgr, err)
+		return
+	}
+
+	lgr = lgr.With(zap.String("account", ctx.Account), zap.String("email", ctx.Email))
+
+	removeContext()
+
+	err = removeAccountDevices(lgr, ctx.Account)
+	if err != nil {
+		internalError(w, lgr, err)
+		return
+	}
+
+	showDeviceRegistrationForm(w, r, lgr, ctx.Account)
+}
 
 func getDeviceInfo(id string) (*DeviceInfo, error) {
 	s, err := redisClient.Get("device:" + id).Result()
@@ -1173,6 +1348,24 @@ func getAccountDevices(account string) ([]string, error) {
 		return nil, err
 	}
 	return slice, nil
+}
+
+func removeAccountDevices(lgr *zap.Logger, account string) error {
+	devices, err := getAccountDevices(account)
+	if err != nil {
+		return err
+	}
+	lgr.Debug("removing devices", zap.Strings("devices", devices))
+
+	for _, d := range devices {
+		err = redisClient.Del("device:" + d).Err()
+		if err != nil {
+			return err
+		}
+		lgr.Debug("device removed", zap.String("device", d))
+	}
+
+	return nil
 }
 
 func registrationDoneHandler(w http.ResponseWriter, r *http.Request) {

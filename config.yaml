@@ -6,6 +6,7 @@ mail:
     user:
     pass:
 confirm_link: https://localhost:9000/register/confirm/
+reset_link: https://localhost:9000/reset/confirm/
 redis:
   addr: blockbook-dev.corp:6379
   pass: ""

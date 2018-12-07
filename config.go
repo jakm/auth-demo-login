@@ -35,6 +35,7 @@ type Config struct {
 		URL   string `yaml:"url"   env:"LOGIN_PAGE_URL"`
 	} `yaml:"login_page"`
 	ConfirmLink  string   `yaml:"confirm_link"  env:"CONFIRM_LINK"`
+	ResetLink    string   `yaml:"reset_link"    env:"RESET_LINK"`
 	DefaultScope []string `yaml:"default_scope" env:"DEFAULT_SCOPE"`
 	ListenAddr   string   `yaml:"listen_addr"   env:"LISTEN_ADDR"`
 }
